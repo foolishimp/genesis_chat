@@ -1,0 +1,20 @@
+agents:
+  - id: claude
+    display_name: Claude (primary)
+    write_territory: .ai-workspace/comments/claude/
+    workflow_bindings:
+      - gen-start
+      - gen-iterate
+    default_projects:
+      - genesis_sdlc
+      - genesis_chat
+      - genesis-manager
+    role: primary
+
+  - id: mock_agent
+    display_name: Mock Agent
+    write_territory: .ai-workspace/comments/mock_agent/
+    workflow_bindings:
+      - gen-start
+    default_projects: []
+    role: secondary

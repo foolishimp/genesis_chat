@@ -1,0 +1,41 @@
+# ergo IRC server — genesis_chat demo, minimal plaintext config
+
+network:
+  name: GenesisNet
+
+server:
+  name: irc.genesis.local
+  listeners:
+    ":6667": {}
+  relaymsg:
+    enabled: false
+  ip-cloaking:
+    enabled: false
+  lookup-hostnames: false
+  forward-confirm-hostnames: false
+
+accounts:
+  authentication-enabled: false
+  registration:
+    enabled: false
+    allow-before-connect: false
+
+channels:
+  registration:
+    enabled: false
+
+limits:
+  nicklen: 32
+  identlen: 20
+  channellen: 64
+  awaylen: 200
+  kicklen: 390
+  topiclen: 390
+
+datastore:
+  path: /ircd/db/ircd.db
+
+logging:
+  - method: stderr
+    level: warn
+    type: "*"

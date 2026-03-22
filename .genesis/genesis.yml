@@ -1,0 +1,6 @@
+# Genesis project config — written by gen-install.py
+# Override per-invocation with: --package MODULE:VAR --worker MODULE:VAR
+package: gtl_spec.packages.genesis_chat:package
+worker:  gtl_spec.packages.genesis_chat:worker
+pythonpath:
+  - builds/python/src

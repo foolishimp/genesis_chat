@@ -1,0 +1,13 @@
+workflow_bindings:
+  gen-start:
+    command: "PYTHONPATH={workspace}/.genesis python -m genesis start --auto --human-proxy"
+    args:
+      workspace: required
+    description: "Run genesis start loop on target project workspace"
+
+  gen-iterate:
+    command: "PYTHONPATH={workspace}/.genesis python -m genesis start --feature {feature}"
+    args:
+      workspace: required
+      feature: required
+    description: "Run one iteration on a specific feature in target project"

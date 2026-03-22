@@ -1,0 +1,16 @@
+commands:
+  - pattern: "^status(?:\\s+(\\S+))?$"
+    handler_name: cmd_status
+    description: "status [project] — list projects or show status for a specific project"
+
+  - pattern: "^gaps(?:\\s+(\\S+))?$"
+    handler_name: cmd_gaps
+    description: "gaps [project] — list projects or show gaps for a specific project"
+
+  - pattern: "^projects$"
+    handler_name: cmd_projects
+    description: "projects — list all available genesis projects"
+
+  - pattern: "^help$"
+    handler_name: cmd_help
+    description: "help — list available commands and work intent syntax"

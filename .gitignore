@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+*.egg
+.DS_Store
+.ai-workspace/events/
+.ai-workspace/features/
+node_modules/

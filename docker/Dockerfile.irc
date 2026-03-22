@@ -1,0 +1,4 @@
+FROM python:3.11-slim
+COPY miniircd.py /miniircd.py
+EXPOSE 6667
+CMD ["python", "/miniircd.py", "6667"]

@@ -1,0 +1,14 @@
+adapters:
+  echo:
+    module: genesis_chat.adapter.echo
+    class: EchoAdapter
+    config_class: null
+    cli_prefix: null
+    requires: []
+
+  irc:
+    module: genesis_chat.adapter.irc
+    class: IRCAdapter
+    config_class: IRCConfig
+    cli_prefix: irc
+    requires: []  # stdlib socket only

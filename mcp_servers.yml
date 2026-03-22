@@ -1,0 +1,8 @@
+# MCP servers for genesis_chat agents.
+# Per ADR-023: MCP is the primary agent transport.
+
+mcp_servers:
+  claude_code:
+    transport: stdio
+    command: npx
+    args: ["-y", "@steipete/claude-code-mcp"]

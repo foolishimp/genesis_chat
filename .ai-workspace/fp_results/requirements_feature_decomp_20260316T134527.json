@@ -1,0 +1,10 @@
+{
+  "edge": "requirements→feature_decomp",
+  "assessments": [
+    {
+      "evaluator": "decomp_complete",
+      "result": "pass",
+      "evidence": "4 feature vectors created covering all 12 REQ keys (12/12, check-req-coverage passes). REQ-F-CHAN (3 keys), REQ-F-AGENT (2 keys), REQ-F-DISP (3 keys), REQ-F-WORKFLOW (4 keys). Dependency DAG: CHAN and AGENT have no dependencies; DISP depends on CHAN+AGENT; WORKFLOW depends on DISP — acyclic. MVP boundary defined in spike scope: EchoAdapter only, two workflow bindings, two agent slots."
+    }
+  ]
+}

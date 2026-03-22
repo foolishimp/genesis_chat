@@ -1,0 +1,70 @@
+services:
+
+  # IRC server — miniircd (zero-dep Python)
+  irc:
+    build:
+      context: .
+      dockerfile: Dockerfile.irc
+    ports:
+      - "6667:6667"
+
+  # Browser IRC client — TheLounge (open http://localhost:9000)
+  thelounge:
+    image: thelounge/thelounge:latest
+    ports:
+      - "9000:9000"
+    volumes:
+      - ./thelounge/config.js:/var/opt/thelounge/config.js
+    depends_on:
+      - irc
+
+  # genesis_chat dispatcher — claude (F_P via MCP claude_code tool)
+  genesis-claude:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ${PROJECTS_ROOT:-/Users/jim/src/apps}:/projects
+    ports:
+      - "8086:8086"
+    command:
+      - "--adapter"
+      - "irc"
+      - "--workspace"
+      - "/projects"
+      - "--irc-host"
+      - "irc"
+      - "--irc-nick"
+      - "claude"
+      - "--irc-channel"
+      - "#genesis"
+      - "--agent-nicks"
+      - "mock_agent"
+      - "--sse-port"
+      - "8086"
+    depends_on:
+      - irc
+    restart: on-failure
+
+  # genesis_chat presence — mock_agent (second slot, channel presence only)
+  genesis-mock:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    volumes:
+      - ${PROJECTS_ROOT:-/Users/jim/src/apps}:/projects
+    command:
+      - "--adapter"
+      - "irc"
+      - "--workspace"
+      - "/projects"
+      - "--irc-host"
+      - "irc"
+      - "--irc-nick"
+      - "mock_agent"
+      - "--irc-channel"
+      - "#genesis"
+      - "--presence-only"
+    depends_on:
+      - irc
+    restart: on-failure
