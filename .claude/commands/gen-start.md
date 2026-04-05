@@ -53,17 +53,14 @@ Call `mcp__claude-code-runner__claude_code` with:
 
 The actor writes its assessment JSON to `manifest["result_path"]`.
 
-**After MCP returns**, the skill reads `result_path` and emits `assessed` for each
-passing evaluator (F_P actors do NOT call emit-event — the skill is the F_D-controlled
-write path per GENESIS_BOOTLOADER §V):
+**After MCP returns**, ingest the result via the engine's assess-result command.
+This resolves manifest provenance (spec_hash, workflow_version) and emits assessed
+events — the skill must NOT emit events directly:
 
-```
-result = read_json(manifest["result_path"])   # {edge, assessments: [{evaluator, result, evidence}]}
-for assessment in result["assessments"]:
-  if assessment["result"] == "pass":
-    PYTHONPATH=.genesis python -m genesis emit-event \
-      --type assessed \
-      --data '{"kind": "fp", "edge": "{edge}", "evaluator": "{evaluator}", "result": "pass"}'
+```bash
+PYTHONPATH=.genesis python -m genesis assess-result \
+  --result "$(echo $manifest | jq -r .result_path)" \
+  --workspace .
 ```
 
 Go to Step 1.

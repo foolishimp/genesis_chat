@@ -3,6 +3,11 @@
 # Implements: REQ-F-BIND-001
 # Implements: REQ-F-PROV-003
 # Implements: REQ-F-PROV-004
+# Implements: REQ-F-PROV-005
+# Implements: REQ-F-EC-002
+# Implements: REQ-F-EC-003
+# Implements: REQ-F-EC-004
+# Implements: REQ-F-EC-005
 """
 bind — F_D pre-computation: bind_fd, bind_fp, select_relevant_contexts,
        render_delta.
@@ -47,10 +52,12 @@ def req_hash(requirements: list[str]) -> str:
 
 def job_evaluator_hash(job: Job) -> str:
     """
-    Hash of all evaluator definitions on this job.
+    Hash of all evaluator definitions and bound context digests on this job.
 
-    Covers F_D (command), F_P/F_H (description), and name+category for all.
-    Changing any evaluator field on the job changes this hash.
+    Covers F_D (command), F_P/F_H (description), name+category for all
+    evaluators, plus every context digest on the edge. Changing any evaluator
+    field or any context's content (detected via digest) changes this hash,
+    automatically invalidating prior F_P certifications.
 
     Used as spec_hash when scope.workflow_version != "unknown". Replaces req_hash
     for workspaces with active-workflow.json present (REQ-F-PROV-003).
@@ -59,7 +66,13 @@ def job_evaluator_hash(job: Job) -> str:
         f"{ev.name}:{ev.category.__name__}:{ev.command}:{ev.description}"
         for ev in job.evaluators
     )
-    raw = "\n".join(re.sub(r'\s+', ' ', line.strip()) for line in lines)
+    # Include context digests so that context content changes invalidate
+    # prior assessed{fp, pass, spec_hash} certifications.
+    ctx_lines = sorted(
+        f"ctx:{ctx.name}:{ctx.digest}"
+        for ctx in (job.edge.context or [])
+    )
+    raw = "\n".join(re.sub(r'\s+', ' ', line.strip()) for line in lines + ctx_lines)
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
@@ -147,6 +160,70 @@ def bind_fh(
                         continue  # Different lens — does not terminate this fluent
                 # Revocation must postdate the approval
                 if latest_approved_time is None or e.get("event_time", "") > latest_approved_time:
+                    return False
+
+    return True
+
+
+def bind_fp_certified(
+    job: Job,
+    ev: Evaluator,
+    all_events: list[dict],
+    spec_hash: str | None = None,
+    current_workflow_version: str = "unknown",
+) -> bool:
+    """
+    Evaluate holdsAt(certified(edge, evaluator, spec_hash, wv), now) for an F_P evaluator.
+
+    Event Calculus semantics (symmetric with bind_fh):
+      assessed{kind: fp, result: pass}  initiates  certified(edge, ev, spec_hash, wv)
+      revoked{kind: fp_assessment}      terminates certified(edge, ev, spec_hash, wv)
+
+    certified(edge, ev, spec_hash, wv) holdsAt now iff:
+      an assessed{pass} event initiates it AND no later revoked{fp_assessment} terminates it,
+      AND spec_hash matches (identity-based termination).
+    """
+    # Find the latest assessed{kind: fp, result: pass} for this edge+evaluator
+    latest_assessed_time = None
+    found_assessed = False
+
+    for e in all_events:
+        etype = e.get("event_type")
+        edata = e.get("data", {})
+
+        is_assessed = (
+            etype == "assessed"
+            and edata.get("kind") == "fp"
+            and edata.get("edge") == job.edge.name
+            and edata.get("evaluator") == ev.name
+            and edata.get("result") == "pass"
+        )
+
+        if is_assessed:
+            # spec_hash identity check
+            if spec_hash is not None and edata.get("spec_hash") != spec_hash:
+                continue  # Different fluent identity — does not initiate
+            found_assessed = True
+            latest_assessed_time = e.get("event_time")
+
+    if not found_assessed:
+        return False
+
+    # Check for terminates: revoked{kind: fp_assessment} postdating the assessed event.
+    # Symmetric with bind_fh revocation check.
+    for e in all_events:
+        etype = e.get("event_type")
+        edata = e.get("data", {})
+        if etype == "revoked" and edata.get("kind") == "fp_assessment":
+            revoked_edge = edata.get("edge")
+            if revoked_edge == job.edge.name or revoked_edge == "*":
+                # Workflow version scoping (symmetric with bind_fh)
+                if current_workflow_version != "unknown":
+                    rev_wv = edata.get("workflow_version")
+                    if rev_wv != current_workflow_version:
+                        continue  # Different lens — does not terminate this fluent
+                # Revocation must postdate the assessment
+                if latest_assessed_time is None or e.get("event_time", "") > latest_assessed_time:
                     return False
 
     return True
@@ -253,18 +330,9 @@ def bind_fd(
         if ev.category is F_P:
             # EC: holdsAt(certified(edge, evaluator, spec_hash, wv), now)
             # Initiated by assessed{kind: fp, result: pass, spec_hash: H}.
-            # Terminated by spec_hash mismatch (new spec = different fluent identity).
-            return any(
-                e.get("event_type") == "assessed"
-                and e.get("data", {}).get("kind") == "fp"
-                and e.get("data", {}).get("edge") == job.edge.name
-                and e.get("data", {}).get("evaluator") == ev.name
-                and e.get("data", {}).get("result") == "pass"
-                and (
-                    spec_hash is None  # caller opted out of snapshot check
-                    or e.get("data", {}).get("spec_hash") == spec_hash
-                )
-                for e in all_events
+            # Terminated by revoked{kind: fp_assessment} or spec_hash mismatch.
+            return bind_fp_certified(
+                job, ev, all_events, spec_hash, current_workflow_version
             )
         return False
 
@@ -335,25 +403,33 @@ def _assemble_prompt(pre: PrecomputedManifest, job: Job, result_path: str = "") 
     """
     Assemble the F_P prompt.
 
-    Structure: INVARIANTS → CURRENT STATE → GAP → RELEVANT CONTEXT → OUTPUT CONTRACT.
-    F_P receives only what it needs to address the gap. Nothing more.
+    Structure: PRECONDITIONS → CURRENT STATE → GAP → CONTEXT → OUTPUT CONTRACT.
+
+    The methodology comes from Context[] on the edge (bootloader, spec, ADRs) —
+    not from hardcoded invariants. The engine is domain-blind; GSDLC (or any
+    domain package) defines what the F_P actor sees via edge.context[].
     """
     sections: list[str] = []
 
-    # [INVARIANTS] — always present
-    sections.append(
-        "[INVARIANTS]\n"
-        "- Assets are projections of the event stream — never mutate state directly.\n"
-        "- emit() is the only write path. event_time is system-assigned.\n"
-        "- Implement only V1 features. No V2 (spawn, consensus, release, multi-tenant).\n"
-        "- All code files must carry: # Implements: REQ-* tags.\n"
-        "- All test files must carry: # Validates: REQ-* tags.\n"
-        "- Exactly 6 modules: core, bind, schedule, manifest, commands, __main__."
-    )
+    # [PRECONDITIONS] — what's guaranteed from upstream (source asset stability)
+    src = job.edge.source
+    if isinstance(src, list):
+        src_name = " × ".join(a.name for a in src)
+        src_markov = {a.name: a.markov for a in src}
+    else:
+        src_name = src.name
+        src_markov = {src.name: src.markov}
+    precond_lines = [
+        "[PRECONDITIONS] — upstream asset stability (these hold):"
+    ]
+    for name, conditions in src_markov.items():
+        if conditions:
+            precond_lines.append(f"  {name}: {conditions}")
+        else:
+            precond_lines.append(f"  {name}: (no markov conditions)")
+    sections.append("\n".join(precond_lines))
 
     # [CURRENT STATE]
-    src = job.edge.source
-    src_name = " × ".join(a.name for a in src) if isinstance(src, list) else src.name
     sections.append(
         f"[CURRENT STATE]\n"
         f"Edge: {job.edge.name}\n"
@@ -374,19 +450,20 @@ def _assemble_prompt(pre: PrecomputedManifest, job: Job, result_path: str = "") 
         gap_lines.append("  (none — all evaluators pass)")
     sections.append("\n".join(gap_lines))
 
-    # [RELEVANT CONTEXT]
+    # [CONTEXT] — full constraint surface from edge.context[], no truncation.
+    # The methodology (bootloader), spec, design ADRs — whatever GSDLC declared
+    # on this edge. The engine does not filter or summarize; the domain package
+    # controls what the F_P actor sees by choosing edge.context[].
     if pre.relevant_contexts:
-        ctx_lines = ["[RELEVANT CONTEXT]:"]
+        ctx_lines = ["[CONTEXT] — constraint surface for this edge:"]
         for name, content in pre.relevant_contexts.items():
-            # Cap each context to avoid overwhelming the F_P actor
-            snippet = content[:4000] + ("…[truncated]" if len(content) > 4000 else "")
-            ctx_lines.append(f"\n--- {name} ---\n{snippet}")
+            ctx_lines.append(f"\n--- {name} ---\n{content}")
         sections.append("\n".join(ctx_lines))
 
     # [OUTPUT CONTRACT]
     # Constitutional constraint: F_P does NOT call the event logger.
     # The actor writes its assessment to result_path. The skill (F_D layer)
-    # reads it and emits assessed{kind: fp} via emit-event CLI. See GENESIS_BOOTLOADER §V.
+    # reads it and emits assessed{kind: fp} via emit-event CLI. See GTL Bootloader §V.
     target = job.edge.target
     fp_failing = [ev for ev in pre.failing_evaluators if ev.category is F_P]
     assessment_contract = ""
@@ -397,8 +474,8 @@ def _assemble_prompt(pre: PrecomputedManifest, job: Job, result_path: str = "") 
         ]
         assessment_contract = (
             f"\n\nWrite assessment JSON to: {result_path}\n"
-            f"Format: {{{{'edge': '{job.edge.name}', 'assessments': [{', '.join(ev_assessments)}]}}}}\n"
-            "The skill reads this file and emits assessed events — do NOT call emit-event yourself."
+            f"Format: {{{{'edge': '{job.edge.name}', 'actor': '<your_agent_id>', 'assessments': [{', '.join(ev_assessments)}]}}}}\n"
+            "The app reads this file and emits assessed events — do NOT call emit-event yourself."
         )
 
     sections.append(

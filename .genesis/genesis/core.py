@@ -2,6 +2,8 @@
 # Implements: REQ-F-CORE-002
 # Implements: REQ-F-CORE-003
 # Implements: REQ-F-CORE-005
+# Implements: REQ-F-EC-001
+# Implements: REQ-F-EC-006
 # Implements: REQ-F-EVAL-005
 # Implements: REQ-F-PROV-002
 """
@@ -102,11 +104,26 @@ class EventStream:
 # Module-level stream reference. Set by workspace_bootstrap() or init_stream().
 _stream: Optional[EventStream] = None
 
+# Module-level snapshot ID. Set by init_snapshot() at engine startup.
+# Work events carry this so they can be mapped back to the constitutional state.
+_active_snapshot_id: Optional[str] = None
+
+# Work event types that must carry package_snapshot_id (PackageSnapshot.work_binding).
+_WORK_EVENT_TYPES = frozenset({
+    "edge_started", "edge_converged", "assessed", "approved", "revoked",
+})
+
 
 def init_stream(stream: EventStream) -> None:
     """Bind the module-level stream. Called by workspace_bootstrap."""
     global _stream
     _stream = stream
+
+
+def init_snapshot(snapshot_id: str) -> None:
+    """Bind the active package snapshot ID. Called at engine startup."""
+    global _active_snapshot_id
+    _active_snapshot_id = snapshot_id
 
 
 def emit(event_type: str, data: dict) -> None:
@@ -141,6 +158,10 @@ def emit(event_type: str, data: dict) -> None:
             f"{event_type} events must include 'kind' field. "
             "Without kind, the event is silently ignored by the projection layer."
         )
+    # PackageSnapshot carrier enforcement: work events must carry package_snapshot_id
+    # so they can be mapped back to the constitutional state that authorized them.
+    if event_type in _WORK_EVENT_TYPES and _active_snapshot_id is not None:
+        data.setdefault("package_snapshot_id", _active_snapshot_id)
     _stream.append(event_type, data)
 
 

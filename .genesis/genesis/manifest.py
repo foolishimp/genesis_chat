@@ -51,12 +51,14 @@ class BoundJob:
     """
     A Job with all Context references resolved.
 
-    prompt carries: INVARIANTS + CURRENT STATE + GAP + RELEVANT CONTEXT
+    prompt carries: PRECONDITIONS + CURRENT STATE + GAP + CONTEXT
                     + OUTPUT CONTRACT.
-    Everything the F_P actor needs. Nothing it doesn't.
+    The prompt is a human-readable render of the structured manifest JSON.
+    The manifest JSON (fp_manifest_path) is the authoritative dispatch contract.
     See ADR-003.
     """
     job: Job
     precomputed: PrecomputedManifest
     prompt: str                            # assembled F_P manifest text
     result_path: str = ""                  # where F_P writes its output
+    manifest_id: str = ""                  # unique dispatch ID for pending-fluent tracking

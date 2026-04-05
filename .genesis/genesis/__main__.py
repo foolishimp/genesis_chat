@@ -19,6 +19,7 @@ Usage:
   python -m genesis start  [--auto] [--human-proxy] [--feature F] [--edge E] [--workspace W]
   python -m genesis iterate [--feature F] [--edge E] [--workspace W]
   python -m genesis gaps    [--feature F] [--workspace W]
+  python -m genesis assess-result --result PATH [--workspace W]
   python -m genesis emit-event --type TYPE [--data JSON] [--workspace W]
   python -m genesis check-tags --type implements|validates --path PATH
 
@@ -89,6 +90,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_emit.add_argument("--workspace", metavar="W", default=".",
                         help="Workspace root (default: cwd)")
 
+    # ── assess-result ──────────────────────────────────────────────────────────
+    p_assess = sub.add_parser("assess-result",
+                              help="Ingest F_P result JSON and emit assessed events")
+    p_assess.add_argument("--result", required=True, metavar="PATH",
+                          help="Path to F_P result JSON file")
+    p_assess.add_argument("--workspace", metavar="W", default=".",
+                          help="Workspace root (default: cwd)")
+
     # ── check-tags ────────────────────────────────────────────────────────────
     p_tags = sub.add_parser("check-tags",
                             help="Verify Implements:/Validates: tags in source files")
@@ -104,7 +113,7 @@ def _build_parser() -> argparse.ArgumentParser:
     src.add_argument("--spec",
                      help="Path to spec file to grep for REQ-* keys (legacy)")
     src.add_argument("--package", metavar="MODULE:VAR",
-                     help="Import path to a Package object, e.g. gtl_spec.packages.genesis_core:genesis_v1")
+                     help="Import path to a Package object, e.g. my_domain.spec:my_package")
     p_cov.add_argument("--features", required=True,
                        help="Directory containing feature vector YAML files")
 
@@ -152,17 +161,27 @@ def _check_tags(tag_type: str, scan_path: str) -> int:
         print(f"ERROR: path does not exist: {path}", file=sys.stderr)
         return 1
 
+    # Directories to skip: run archives, caches, installed workspace copies
+    _SKIP_DIRS = {"runs", "__pycache__", ".pytest_cache", "node_modules", ".venv", "venv"}
+
+    def _should_skip(filepath: Path) -> bool:
+        return any(part in _SKIP_DIRS for part in filepath.parts)
+
     untagged = []
     for f in sorted(path.rglob("*.py")):
         if f.name == "__init__.py":
             continue
+        if _should_skip(f):
+            continue
         if tag not in f.read_text(encoding="utf-8"):
             untagged.append(str(f))
 
+    all_files = [f for f in path.rglob("*.py")
+                 if f.name != "__init__.py" and not _should_skip(f)]
     result = {
         "tag": tag,
         "path": str(path),
-        "scanned": len([f for f in path.rglob("*.py") if f.name != "__init__.py"]),
+        "scanned": len(all_files),
         "untagged_count": len(untagged),
         "untagged": untagged,
         "passes": len(untagged) == 0,
@@ -365,13 +384,142 @@ def _check_bootloader_consistency(spec_module: str, bootloader_path: str) -> int
     return 0 if result["passes"] else 1
 
 
+def _assess_result_cmd(result_path: str, workspace: Path) -> int:
+    """
+    Ingest an F_P result JSON file and emit assessed events.
+
+    This is the app-level consumer that closes the result_path protocol:
+      1. F_P actor writes assessment JSON to result_path
+      2. This command reads it, resolves provenance from the matching manifest
+      3. Emits one assessed{kind: fp} event per assessment entry
+
+    The result file format (as declared in the manifest OUTPUT CONTRACT):
+      {"edge": "X→Y", "actor": "agent_id", "assessments": [
+        {"evaluator": "name", "result": "pass|fail", "evidence": "..."}
+      ]}
+
+    Callable by both the skill layer (gen-start.md) and the test harness.
+    """
+    import json as _json
+    from datetime import datetime, timezone
+
+    from genesis.commands import _read_workflow_version
+
+    rpath = Path(result_path)
+    if not rpath.exists():
+        print(f"ERROR: result file not found: {rpath}", file=sys.stderr)
+        return 1
+
+    try:
+        result_data = _json.loads(rpath.read_text(encoding="utf-8"))
+    except _json.JSONDecodeError as exc:
+        print(f"ERROR: result file is not valid JSON: {exc}", file=sys.stderr)
+        return 1
+
+    # Validate result structure
+    edge = result_data.get("edge")
+    actor = result_data.get("actor", "")
+    assessments = result_data.get("assessments")
+    if not edge:
+        print("ERROR: result file missing 'edge' field", file=sys.stderr)
+        return 1
+    if not actor:
+        print("ERROR: result file missing 'actor' field", file=sys.stderr)
+        return 1
+    if not isinstance(assessments, list) or not assessments:
+        print("ERROR: result file missing or empty 'assessments' array", file=sys.stderr)
+        return 1
+
+    # Resolve manifest for provenance — manifest_id is embedded in the result filename
+    # Result file: fp_results/<manifest_id>.json
+    # Manifest file: fp_manifests/<manifest_id>.json
+    manifest_id = rpath.stem
+    manifests_dir = workspace / ".ai-workspace" / "fp_manifests"
+    manifest_file = manifests_dir / f"{manifest_id}.json"
+
+    spec_hash = ""
+    if manifest_file.exists():
+        try:
+            manifest = _json.loads(manifest_file.read_text(encoding="utf-8"))
+            spec_hash = manifest.get("spec_hash", "")
+        except _json.JSONDecodeError:
+            print(f"WARNING: manifest {manifest_file} is not valid JSON, "
+                  "proceeding without spec_hash", file=sys.stderr)
+    else:
+        print(f"WARNING: no matching manifest found at {manifest_file}, "
+              "proceeding without spec_hash", file=sys.stderr)
+
+    if not spec_hash:
+        print("ERROR: spec_hash is required for assessed{kind: fp} events "
+              "but could not be resolved from manifest", file=sys.stderr)
+        return 1
+
+    # Resolve workflow_version
+    _config = _load_project_config(workspace)
+    workflow_version = _read_workflow_version(
+        workspace, _config.get("active_workflow")
+    )
+
+    # Emit one assessed event per assessment entry
+    events_dir = workspace / ".ai-workspace" / "events"
+    events_dir.mkdir(parents=True, exist_ok=True)
+    events_file = events_dir / "events.jsonl"
+
+    emitted = []
+    for assessment in assessments:
+        evaluator = assessment.get("evaluator")
+        result_val = assessment.get("result")
+        evidence = assessment.get("evidence", "")
+
+        if not evaluator:
+            print("ERROR: assessment entry missing 'evaluator' field",
+                  file=sys.stderr)
+            return 1
+        if result_val not in ("pass", "fail"):
+            print(f"ERROR: assessment 'result' must be 'pass' or 'fail', "
+                  f"got {result_val!r}", file=sys.stderr)
+            return 1
+
+        event_data = {
+            "kind": "fp",
+            "edge": edge,
+            "evaluator": evaluator,
+            "result": result_val,
+            "evidence": evidence,
+            "actor": actor,
+            "spec_hash": spec_hash,
+            "manifest_id": manifest_id,
+            "workflow_version": workflow_version,
+        }
+        event = {
+            "event_type": "assessed",
+            "event_time": datetime.now(timezone.utc).isoformat(),
+            "data": event_data,
+        }
+        with events_file.open("a", encoding="utf-8") as f:
+            f.write(_json.dumps(event) + "\n")
+        emitted.append({"evaluator": evaluator, "result": result_val})
+
+    output = {
+        "status": "ok",
+        "command": "assess-result",
+        "result_path": result_path,
+        "manifest_id": manifest_id,
+        "spec_hash": spec_hash,
+        "events_emitted": len(emitted),
+        "assessments": emitted,
+    }
+    print(_json.dumps(output, indent=2))
+    return 0
+
+
 def _emit_event_cmd(event_type: str, data_json: str, workspace: Path) -> int:
     """
     Append one event to .ai-workspace/events/events.jsonl.
 
     This is an F_D-controlled write path called by the skill layer (gen-start.md),
     never by F_P actors directly. F_P actors write to result_path; the skill reads
-    the result and calls emit-event. See GENESIS_BOOTLOADER §V (event-time invariant).
+    the result and calls emit-event. See GTL Bootloader §V (event-time invariant).
 
     Governance: required fields validated per event type (prime operators).
       approved  — requires: kind (fh_review | fh_intent), edge, actor (human | human-proxy)
@@ -427,6 +575,8 @@ def _emit_event_cmd(event_type: str, data_json: str, workspace: Path) -> int:
         for fld in ("kind", "edge", "actor", "reason"):
             if fld not in data:
                 errors.append(f"revoked requires '{fld}' field")
+        if data.get("kind") not in (None, "fh_approval", "fp_assessment"):
+            errors.append(f"revoked 'kind' must be 'fh_approval' or 'fp_assessment', got '{data.get('kind')!s}'")
 
     if errors:
         for msg in errors:
@@ -435,7 +585,11 @@ def _emit_event_cmd(event_type: str, data_json: str, workspace: Path) -> int:
 
     # Annotate workflow_version from active-workflow.json (REQ-F-PROV-002).
     # Reads the file directly — emit-event runs pre-stack without a Scope object.
-    data["workflow_version"] = _read_workflow_version(workspace)
+    # Honour the runtime contract: if genesis.yml declares active_workflow, use it.
+    _config = _load_project_config(workspace)
+    data["workflow_version"] = _read_workflow_version(
+        workspace, _config.get("active_workflow")
+    )
 
     events_dir = workspace / ".ai-workspace" / "events"
     events_dir.mkdir(parents=True, exist_ok=True)
@@ -452,15 +606,13 @@ def _emit_event_cmd(event_type: str, data_json: str, workspace: Path) -> int:
     return 0
 
 
-def _load_project_config(workspace: Path) -> dict:
+def _parse_yaml_config(config_path: Path) -> dict:
     """
-    Read .genesis/genesis.yml — key: value pairs and YAML lists.
+    Parse a simple YAML config file — key: value pairs and YAML lists.
 
-    Returns a dict with 'package', 'worker', and/or 'pythonpath' keys.
-    'pythonpath' is returned as a list[str].
+    Returns a dict. 'pythonpath' (and any list-valued key) is returned as list[str].
     Returns empty dict if the file does not exist.
     """
-    config_path = workspace / ".genesis" / "genesis.yml"
     if not config_path.exists():
         return {}
     config: dict = {}
@@ -488,6 +640,33 @@ def _load_project_config(workspace: Path) -> dict:
     return config
 
 
+def _load_project_config(workspace: Path) -> dict:
+    """
+    Load the project runtime contract.
+
+    Single entry point: .genesis/genesis.yml (written by ABG kernel installer).
+    If the config contains a `runtime_contract` key, that path is read as the
+    authoritative override (domain installer sets this when it installs).
+
+    Discovery chain:
+      1. Read .genesis/genesis.yml
+      2. If it contains runtime_contract: <path>, read that file instead
+      3. Otherwise use the kernel config as-is
+
+    The kernel never hardcodes domain-specific paths. Domain installers
+    set runtime_contract in .genesis/genesis.yml to point to their own contract.
+    """
+    kernel_config = _parse_yaml_config(workspace / ".genesis" / "genesis.yml")
+
+    contract_ref = kernel_config.get("runtime_contract")
+    if contract_ref:
+        contract_path = (workspace / contract_ref).resolve()
+        if contract_path.exists():
+            return _parse_yaml_config(contract_path)
+
+    return kernel_config
+
+
 def _import_symbol(ref: str, workspace: Path):
     """
     Import MODULE:VAR from workspace. Returns the symbol.
@@ -513,7 +692,7 @@ def _resolve_package_worker(args, workspace: Path):
     """
     Resolve Package and Worker.
 
-    Precedence: --package/--worker flags > .genesis/genesis.yml > error.
+    Precedence: --package/--worker flags > runtime contract (genesis.yml) > error.
     Validates symbol types. Exits with code 1 on any failure.
     """
     pkg_ref = getattr(args, "package", None) or None
@@ -528,7 +707,7 @@ def _resolve_package_worker(args, workspace: Path):
         print(
             "ERROR: no package/worker configured.\n"
             "  Pass --package MODULE:VAR --worker MODULE:VAR, or\n"
-            "  run gen-install.py to create .genesis/genesis.yml",
+            "  run the domain installer to create the runtime contract",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -568,7 +747,9 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
-    # Lightweight commands — no engine stack needed
+    # Lightweight commands — no engine stack needed.
+    # These are pure F_D file-scanning commands: no events emitted, no provenance,
+    # no workflow_version. They are explicitly out of runtime contract scope.
     if args.command == "check-tags":
         sys.exit(_check_tags(args.type, args.path))
     if args.command == "check-req-coverage":
@@ -583,6 +764,11 @@ def main() -> None:
         sys.exit(_check_tag_coverage("validates", args.package, args.path))
     if args.command == "check-bootloader-consistency":
         sys.exit(_check_bootloader_consistency(args.spec_module, args.bootloader))
+
+    # assess-result: ingest F_P result JSON → emit assessed events
+    if args.command == "assess-result":
+        workspace = Path(args.workspace).resolve()
+        sys.exit(_assess_result_cmd(args.result, workspace))
 
     # emit-event: appends one event to events.jsonl — no engine stack needed
     if args.command == "emit-event":
@@ -622,7 +808,14 @@ def main() -> None:
         feature=getattr(args, "feature", None),
         edge=getattr(args, "edge", None),
         worker=worker,
+        active_workflow_path=_config.get("active_workflow"),
+        workflow_root=_config.get("workflow_root"),
     )
+
+    # Bind active snapshot so work events carry package_snapshot_id.
+    from .core import init_snapshot
+    snapshot_id = f"snap-{package.name}-{scope.workflow_version}"
+    init_snapshot(snapshot_id)
 
     if args.command == "start":
         human_proxy = getattr(args, "human_proxy", False)

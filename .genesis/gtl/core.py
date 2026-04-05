@@ -24,6 +24,7 @@ v0.2.1 (Codex findings addressed 2026-03-14):
 No external dependencies. Dataclasses + stdlib only.
 """
 from __future__ import annotations
+import warnings
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Protocol
 
@@ -479,6 +480,30 @@ class Package:
             raise ValueError(
                 "Package validation failed:\n" + "\n".join(f"  - {e}" for e in errors)
             )
+
+        # Warn about assets with no inbound edge that aren't graph roots.
+        # An asset is a "target" if it appears as the target of any edge.
+        # An asset is a "source" if it appears as the source of any edge.
+        # A graph root is an asset that is a source but never a target.
+        # An unreachable asset is one that is never a target AND never a source
+        # (i.e., it appears in no edge at all), or more precisely: it has no
+        # inbound edge and is not a graph root (not a source of any edge).
+        targets: set[str] = set()
+        sources: set[str] = set()
+        for edge in self.edges:
+            targets.add(edge.target.name)
+            if isinstance(edge.source, list):
+                sources.update(a.name for a in edge.source)
+            else:
+                sources.add(edge.source.name)
+
+        for asset in self.assets:
+            if asset.name not in targets and asset.name not in sources:
+                warnings.warn(
+                    f"Asset '{asset.name}' has no inbound edge and is not a "
+                    f"graph root — it may be unreachable",
+                    stacklevel=2,
+                )
 
     def describe(self) -> str:
         lines = [f"Package: {self.name}"]

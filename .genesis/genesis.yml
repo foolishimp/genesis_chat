@@ -4,3 +4,4 @@ package: gtl_spec.packages.genesis_chat:package
 worker:  gtl_spec.packages.genesis_chat:worker
 pythonpath:
   - builds/python/src
+runtime_contract: .gsdlc/release/genesis.yml

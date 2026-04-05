@@ -46,17 +46,14 @@ Call `mcp__claude-code-runner__claude_code` with:
 
 The actor writes its assessment JSON to `manifest["result_path"]`.
 
-**After MCP returns**, the skill reads `result_path` and emits `assessed` for each
-passing evaluator (F_P actors do NOT call emit-event — the skill is the F_D-controlled
-write path per GENESIS_BOOTLOADER §V):
+**After MCP returns**, ingest the result via the engine's assess-result command.
+This resolves manifest provenance (spec_hash, workflow_version) and emits assessed
+events — the skill must NOT emit events directly:
 
-```
-result = read_json(manifest["result_path"])   # {edge, assessments: [{evaluator, result, evidence}]}
-for assessment in result["assessments"]:
-  if assessment["result"] == "pass":
-    PYTHONPATH=.genesis python -m genesis emit-event \
-      --type assessed \
-      --data '{"kind": "fp", "edge": "{edge}", "evaluator": "{evaluator}", "result": "pass"}'
+```bash
+PYTHONPATH=.genesis python -m genesis assess-result \
+  --result "$(echo $manifest | jq -r .result_path)" \
+  --workspace .
 ```
 
 Go to Step 1.
@@ -122,18 +119,17 @@ Violation causes unbounded subprocess recursion. When authoring evaluators:
 - `pytest` with no marker — incorrect if any e2e test invokes genesis commands
 - Any `genesis gaps|start|iterate` call — incorrect (cyclic)
 
-### `unit_tests→uat_tests` edge
+### `user_guide→uat_tests` edge
 
-The F_H gate for this edge requires **sandbox e2e evidence** before approval is granted.
-The F_P evaluator (`uat_e2e_passed`) is responsible for:
-1. Installing the project into a fresh sandbox directory via the installer
-2. Running e2e tests in that sandbox (`pytest -m e2e`)
-3. Reporting sandbox path, test count, and pass/fail
+The F_H gate for this edge requires **sandbox e2e evidence** and a **current user guide**
+before approval is granted. The upstream `unit_tests→integration_tests` edge produces the
+sandbox report; the `integration_tests→user_guide` edge certifies the guide.
 
-The F_H gate (`uat_accepted`) cannot be approved without that evidence.
-`--human-proxy` may proxy this gate only if the F_P actor's sandbox report is available and
-all e2e scenarios pass. A proxy approval on this edge without a sandbox report is a log-integrity
-violation (event emitted without the work having occurred).
+`--human-proxy` may proxy this gate only if:
+1. `sandbox_report.json` shows `all_pass: true`
+2. `USER_GUIDE.md` is version-current and REQ-coverage-tagged
+
+A proxy approval without both is a log-integrity violation.
 
 Unit tests alone (`code↔unit_tests`) are necessary but not sufficient.
-**Shipping requires sandbox proof.**
+**Shipping requires sandbox proof and a current guide.**

@@ -36,17 +36,28 @@ from .schedule import delta, iterate, schedule
 
 # ── Workflow provenance helpers ───────────────────────────────────────────────
 
-def _read_workflow_version(workspace: Path) -> str:
+def _read_workflow_version(workspace: Path, active_workflow_path: str | None = None) -> str:
     """
-    Read .genesis/active-workflow.json and return "{workflow}@{version}".
+    Read active-workflow.json and return "{workflow}@{version}".
+
+    When *active_workflow_path* is provided (from genesis.yml runtime contract),
+    it is resolved relative to workspace and used as the authoritative location.
+    Otherwise reads .ai-workspace/runtime/active-workflow.json.
+
+    .genesis/ is immutable installed runtime — no fallback to it. Mutable state
+    must live under .ai-workspace/. The installer (gen-install.py) is responsible
+    for creating the runtime directory and migrating legacy locations.
 
     Returns "unknown" on any failure: file absent, invalid JSON, missing keys,
     non-string values. The engine never fails to start due to this file's state.
 
-    Pure function — no Scope dependency. Called by Scope.__post_init__ at
-    engine startup and by _emit_event_cmd at CLI call time (REQ-F-PROV-001/002).
+    Pure read — no side effects. Called by Scope.__post_init__ at engine startup
+    and by _emit_event_cmd at CLI call time (REQ-F-PROV-001/002).
     """
-    active_wf = workspace / ".genesis" / "active-workflow.json"
+    if active_workflow_path:
+        active_wf = (workspace / active_workflow_path).resolve()
+    else:
+        active_wf = workspace / ".ai-workspace" / "runtime" / "active-workflow.json"
     try:
         data = json.loads(active_wf.read_text(encoding="utf-8"))
         workflow = data["workflow"]
@@ -62,9 +73,12 @@ def _read_carry_forward(scope: "Scope") -> list[dict]:
     """
     Read approved_carry_forward from the variant manifest.json.
 
-    Path: .genesis/workflows/{pkg}/{variant}/{version}/manifest.json
-    where workflow "genesis_sdlc.standard@0.2.0" → pkg="genesis_sdlc",
+    Path: {workflow_root}/{pkg}/{variant}/{version}/manifest.json
+    where workflow "my_domain.standard@0.2.0" → pkg="my_domain",
     variant="standard", version="0.2.0".
+
+    When scope.workflow_root is set (from genesis.yml runtime contract), it is
+    used as the base directory. Otherwise falls back to .genesis/workflows/.
 
     Returns [] if workflow_version is "unknown", file absent, or key missing.
     """
@@ -75,9 +89,12 @@ def _read_carry_forward(scope: "Scope") -> list[dict]:
     pkg_name = parts[0]
     variant = parts[1] if len(parts) > 1 else "default"
     version_dir = "v" + version.replace(".", "_")
+    if scope.workflow_root:
+        wf_base = (scope.workspace_root / scope.workflow_root).resolve()
+    else:
+        wf_base = scope.workspace_root / ".genesis" / "workflows"
     manifest_path = (
-        scope.workspace_root / ".genesis" / "workflows"
-        / pkg_name / variant / version_dir / "manifest.json"
+        wf_base / pkg_name / variant / version_dir / "manifest.json"
     )
     try:
         data = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -102,9 +119,16 @@ class Scope:
         _resolve_worker() falls back to the genesis self-hosting spec import
         (V1 CLI convenience; remove in V2 — callers should always supply worker).
 
-    workflow_version: read from .genesis/active-workflow.json at construction.
+    active_workflow_path: relative path to active-workflow.json, read from
+        genesis.yml runtime contract. When set, used instead of the default
+        .ai-workspace/runtime/active-workflow.json.
+
+    workflow_root: relative path to workflow releases base directory, read from
+        genesis.yml runtime contract. When set, used instead of .genesis/workflows/.
+
+    workflow_version: derived at construction from active-workflow.json.
         "{workflow}@{version}" when file present and valid; "unknown" otherwise.
-        When "unknown", provenance checks are bypassed (no active-workflow.json present).
+        When "unknown", provenance checks are bypassed.
 
     Build identifier is build-layer specific. This Claude Code build defaults to "claude_code".
     """
@@ -114,10 +138,14 @@ class Scope:
     edge: Optional[str] = None        # edge name override (None = topological)
     build: str = "claude_code"
     worker: Optional[Worker] = None   # explicit worker; None = spec-import fallback
+    active_workflow_path: Optional[str] = None  # runtime contract: path to active-workflow.json
+    workflow_root: Optional[str] = None         # runtime contract: base dir for workflow releases
     workflow_version: str = field(init=False, default="unknown")
 
     def __post_init__(self) -> None:
-        self.workflow_version = _read_workflow_version(self.workspace_root)
+        self.workflow_version = _read_workflow_version(
+            self.workspace_root, self.active_workflow_path
+        )
 
 
 # ── gen_gaps — bind_fd over scope ─────────────────────────────────────────────
@@ -262,39 +290,35 @@ def gen_iterate(
     fp_failing = [ev for ev in selected_pre.failing_evaluators if ev.category is _F_P]
     fh_failing = [ev for ev in selected_pre.failing_evaluators if ev.category is _F_H]
 
-    # REQ-F-GATE-002: do not produce an F_P manifest while F_D is red.
-    # The gate is enforced in schedule.iterate() — this layer must not create
-    # orphaned manifest files that imply a dispatch will happen when it won't.
-    # Emit found{kind: fd_gap} so gen_start(auto=True) event-based detection at
-    # commands.py#L314 fires correctly — without this event, the auto-loop
-    # cannot distinguish "fd_gap" from "no progress" and loops to max_iterations.
-    if fd_failing and fp_failing:
-        stream.append("found", {
-            "kind": "fd_gap",
-            "edge": selected_job.edge.name,
-            "failing": [ev.name for ev in fd_failing],
-            "delta_summary": selected_pre.delta_summary,
-        })
-        return {
-            "status": "iterated",
-            "edge": selected_job.edge.name,
-            "delta_before": selected_pre.delta,
-            "failing_evaluators": [ev.name for ev in selected_pre.failing_evaluators],
-            "events_emitted": 1,
-            "stopped_by": "fd_gap",
-        }
+    # REQ-F-GATE-002 (ADR-021): F_D findings escalate to F_P — no early return.
+    # The fd_gap early return was removed. iterate() now emits both
+    # found{kind: fd_findings} and fp_dispatched when F_D and F_P are both failing.
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     edge_slug = selected_job.edge.name.replace("→", "_").replace("↔", "_")
+    manifest_id = f"{edge_slug}_{ts}"
+
+    # Check for pending F_P dispatch (fp_dispatched without matching assessed).
+    # Prevents duplicate dispatch while a prior F_P invocation is still in flight.
+    if fp_failing:
+        pending_id = _find_pending_dispatch(stream, selected_job.edge.name)
+        if pending_id is not None:
+            return {
+                "status": "pending",
+                "reason": f"F_P dispatch already in flight for edge {selected_job.edge.name!r}",
+                "pending_manifest_id": pending_id,
+                "edge": selected_job.edge.name,
+            }
 
     result_path = ""
     if fp_failing:
         fp_results_dir = scope.workspace_root / ".ai-workspace" / "fp_results"
         fp_results_dir.mkdir(parents=True, exist_ok=True)
-        result_path = str(fp_results_dir / f"{edge_slug}_{ts}.json")
+        result_path = str(fp_results_dir / f"{manifest_id}.json")
 
     # Bind + iterate
     bound = bind_fp(selected_pre, selected_job, result_path=result_path)
+    bound.manifest_id = manifest_id
     # REQ-F-CORE-001: include target so project() "current" projection can filter
     # edge_started to only the asset type being produced by this edge.
     stream.append("edge_started", {
@@ -316,23 +340,61 @@ def gen_iterate(
         "failing_evaluators": [ev.name for ev in selected_pre.failing_evaluators],
         "events_emitted": len(surface.events) + 1,  # +1 for edge_started
         "prompt_words": len(bound.prompt.split()),
+        "surface_artifacts": surface.artifacts,
+        "context_consumed": [c.name for c in surface.context_consumed],
     }
 
     # Write F_P manifest to disk when F_P dispatch is needed.
-    # gen-start.md reads fp_manifest_path to get the prompt for MCP dispatch.
+    # The manifest JSON is the authoritative F_P dispatch contract.
+    # Any conforming transport (Claude Code, API, Codex) must be able to
+    # execute from this JSON alone — CLAUDE.md is convenience, not authority.
     if fp_failing:
         manifests_dir = scope.workspace_root / ".ai-workspace" / "fp_manifests"
         manifests_dir.mkdir(parents=True, exist_ok=True)
-        manifest_file = manifests_dir / f"{edge_slug}_{ts}.json"
+        manifest_file = manifests_dir / f"{manifest_id}.json"
+
+        # Source asset(s) — handle product arrows (A × B)
+        src = selected_job.edge.source
+        if isinstance(src, list):
+            source_asset = [a.name for a in src]
+            source_markov = {a.name: a.markov for a in src}
+        else:
+            source_asset = src.name
+            source_markov = {src.name: src.markov}
+
+        # Context references with locator + digest + resolved content
+        contexts = []
+        for ctx in selected_job.edge.context:
+            ctx_entry: dict = {
+                "name": ctx.name,
+                "locator": ctx.locator,
+                "digest": ctx.digest,
+            }
+            if ctx.name in selected_pre.relevant_contexts:
+                ctx_entry["content"] = selected_pre.relevant_contexts[ctx.name]
+            contexts.append(ctx_entry)
+
         manifest = {
+            "manifest_id": manifest_id,
             "edge": selected_job.edge.name,
+            "source_asset": source_asset,
+            "target_asset": selected_job.edge.target.name,
+            "source_markov": source_markov,
+            "target_markov": selected_job.edge.target.markov,
             "failing_evaluators": [
-                {"name": ev.name, "description": ev.description}
+                {"name": ev.name, "category": ev.category.__name__,
+                 "description": ev.description}
                 for ev in fp_failing
             ],
+            "fd_results": selected_pre.fd_results,
+            "delta": selected_pre.delta,
+            "delta_summary": selected_pre.delta_summary,
+            "contexts": contexts,
+            "current_asset": selected_pre.current_asset,
             "prompt": bound.prompt,
             "result_path": result_path,
             "spec_hash": spec_hash,
+            "requirements": scope.package.requirements,
         }
         manifest_file.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         result["fp_manifest_path"] = str(manifest_file)
@@ -391,7 +453,7 @@ def gen_start(
         result = gen_iterate(scope, stream, on_fp_dispatch=on_fp_dispatch)
         result["auto"] = True
 
-        if result["status"] in ("converged", "nothing_to_do"):
+        if result["status"] in ("converged", "nothing_to_do", "pending"):
             return result
 
         # Inspect events emitted by this iteration
@@ -406,7 +468,10 @@ def gen_start(
         if "fh_gate_pending" in new_types:
             result["stopped_by"] = "fh_gate"
             return result
-        if "found" in new_types:
+        # REQ-F-GATE-002 (ADR-021): only terminal fd_gap stops the loop.
+        # fd_findings (escalation) accompanies fp_dispatched which stops above.
+        if any(e["event_type"] == "found" and e.get("data", {}).get("kind") == "fd_gap"
+               for e in new_events):
             result["stopped_by"] = "fd_gap"
             return result
 
@@ -443,6 +508,49 @@ def _derive_state(scope: Scope, stream: EventStream) -> dict:
         return {"status": "converged"}
 
     return {"status": "in_progress", "delta": total_delta}
+
+
+# ── pending dispatch fluent ───────────────────────────────────────────────────
+
+def _find_pending_dispatch(stream: EventStream, edge_name: str) -> Optional[str]:
+    """
+    Check for an outstanding F_P dispatch on this edge.
+
+    Returns the manifest_id of the pending dispatch, or None if no dispatch
+    is in flight. A dispatch is pending when an fp_dispatched event exists
+    for this edge with a manifest_id that has no corresponding assessed event.
+
+    Event Calculus:
+      fp_dispatched{manifest_id: M}  initiates  pending(edge, M)
+      assessed{manifest_id: M}       terminates pending(edge, M)
+    """
+    all_events = stream.all_events()
+
+    # Collect all manifest_ids dispatched for this edge
+    dispatched_ids: set[str] = set()
+    for e in all_events:
+        if (
+            e.get("event_type") == "fp_dispatched"
+            and e.get("data", {}).get("edge") == edge_name
+            and e.get("data", {}).get("manifest_id")
+        ):
+            dispatched_ids.add(e["data"]["manifest_id"])
+
+    if not dispatched_ids:
+        return None
+
+    # Remove any that have a matching assessed event
+    for e in all_events:
+        if (
+            e.get("event_type") == "assessed"
+            and e.get("data", {}).get("manifest_id") in dispatched_ids
+        ):
+            dispatched_ids.discard(e["data"]["manifest_id"])
+
+    # Return the first remaining pending dispatch (if any)
+    if dispatched_ids:
+        return next(iter(dispatched_ids))
+    return None
 
 
 # ── internal helpers ──────────────────────────────────────────────────────────

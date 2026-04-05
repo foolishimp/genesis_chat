@@ -7,4 +7,6 @@ dist/
 .DS_Store
 .ai-workspace/events/
 .ai-workspace/features/
+.ai-workspace/runtime/
+.gsdlc/
 node_modules/
